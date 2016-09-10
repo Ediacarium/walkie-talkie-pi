@@ -1,0 +1,9 @@
+[package]
+name = "walkie-talkie-pi"
+version = "0.1.0"
+authors = ["alex <ediacarium@github.com>"]
+
+[dependencies]
+bincode = "*"
+rustc-serialize = "*"
+log = "*"
