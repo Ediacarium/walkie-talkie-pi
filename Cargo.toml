@@ -7,3 +7,5 @@ authors = ["alex <ediacarium@github.com>"]
 bincode = "*"
 rustc-serialize = "*"
 log = "*"
+env_logger = "*"
+rand = "*"
