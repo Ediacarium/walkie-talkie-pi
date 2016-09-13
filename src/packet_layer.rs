@@ -7,10 +7,17 @@ use std::collections::HashMap;
 use std::sync::mpsc::{channel,Sender,Receiver};
 use std::thread;
 use std::thread::{JoinHandle};
-use std::net::UdpSocket;
 use bincode::rustc_serialize::{encode, decode};
 use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::RecvError;
+use std::sync::Arc;
+use std::net::UdpSocket;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
+use std::io::Error as IOError;
+
+static IP_ADDR_ANY : &'static str = "0.0.0.0";
+static BROADCAST_ALL : &'static str = "255.255.255.255";
 
 
 #[derive(RustcEncodable, RustcDecodable, PartialEq, Eq, Clone, Hash)]
@@ -43,12 +50,42 @@ enum SendablePackets {
 	PayloadPacket(PayloadPacket)
 }
 
-pub struct PacketLayer {
+pub struct PacketSender {
 	ip_address: i64,
-	port : u16,
+	port: u16,
 	sequence_number: u8,
-	worker: (JoinHandle<()>,Sender<PayloadPacket>,Receiver<PayloadPacket>),
-	socket: UdpSocket
+	sender: Sender<PayloadPacket>,
+	socket: UdpSocket,
+	worker: Arc<JoinHandle<()>>
+}
+
+pub struct PacketReceiver {
+	receiver: Receiver<PayloadPacket>,
+	worker: Arc<JoinHandle<()>>
+}
+
+pub fn packet_layer(port: u16, ip_address:i64) -> Result<(PacketSender, PacketReceiver),IOError>{
+	let (send_tx,send_rx) = channel();
+	let (receive_tx, receive_rx) = channel();
+	let socket = try!(UdpSocket::bind((IP_ADDR_ANY,port)));
+	let worker_socket = socket.try_clone().unwrap();
+	worker_socket.set_broadcast(true);
+	worker_socket.join_multicast_v4(&Ipv4Addr::from_str(BROADCAST_ALL).unwrap(),&Ipv4Addr::from_str(IP_ADDR_ANY).unwrap());
+	let workthread = thread::spawn(move|| {worker_loop(port,ip_address,worker_socket,send_rx,receive_tx)});
+	let worker = Arc::new(workthread);
+	Ok((PacketSender {
+		ip_address : ip_address,
+		sequence_number : 0,
+		socket : socket,
+		port : port,
+		worker: worker.clone(),
+		sender: send_tx
+	},
+	PacketReceiver{
+		receiver: receive_rx,
+		worker : worker,
+	}))
+		
 }
 
 impl PacketId {
@@ -87,41 +124,31 @@ impl PayloadPacket {
 	}
 }
 
-
-impl PacketLayer {
-	pub fn new(port: u16, ip_address:i64, socket:UdpSocket) -> Self{
-		let (send_tx,send_rx) = channel();
-		let (receive_tx, receive_rx) = channel();
-		let worker_socket = socket.try_clone().unwrap();
-		let workthread = thread::spawn(move|| {worker_loop(port,ip_address,worker_socket,send_rx,receive_tx)});
-		PacketLayer{
-			ip_address : ip_address,
-			sequence_number : 0,
-			worker : (workthread, send_tx, receive_rx),
-			socket : socket,
-			port : port
-		}
-	}
-	
-	pub fn receive(&self) -> Result<(Vec<u8>,i64,u8),RecvError>{
-		let packet = try!(self.worker.2.recv());
-		Ok((packet.payload,packet.packet.source_ip_addr,packet.packet.sequence_number))
-	}
-	
-	pub fn try_receive(&self) -> Result<(Vec<u8>,i64,u8),TryRecvError> {
-		let packet = try!(self.worker.2.try_recv());
-		Ok((packet.payload,packet.packet.source_ip_addr,packet.packet.sequence_number))
-	}
-	
+impl PacketSender {	
 	pub fn send(&mut self, payload: Vec<u8>){
 		debug!("got new payload to send");
 		let packet = PayloadPacket::new(&payload,self.ip_address,self.sequence_number);
 		let advertisement = SendablePackets::AdvertisementPacket(AdvertisementPacket::new(&packet, self.ip_address));
-		self.worker.1.send(packet);
+		self.sender.send(packet);
 		
 		let advertisement_encoded = &encode(&advertisement, SizeLimit::Infinite).unwrap();
 		debug!("sending {} Bytes",advertisement_encoded.len());
-		self.socket.send_to(&advertisement_encoded,("255.255.255.255",self.port));
+		match self.socket.send_to(&advertisement_encoded,(BROADCAST_ALL,self.port)) {
+			Ok(_) => debug!("Successfully sent advertisement!"),
+			Err(e) => error!("Failed to send advertisement: {}", e)
+		}
+	}
+}
+
+impl PacketReceiver {
+	pub fn receive(&self) -> Result<(Vec<u8>,i64,u8),RecvError>{
+		let packet = try!(self.receiver.recv());
+		Ok((packet.payload,packet.packet.source_ip_addr,packet.packet.sequence_number))
+	}
+	
+	pub fn try_receive(&self) -> Result<(Vec<u8>,i64,u8),TryRecvError> {
+		let packet = try!(self.receiver.try_recv());
+		Ok((packet.payload,packet.packet.source_ip_addr,packet.packet.sequence_number))
 	}
 }
 
@@ -132,7 +159,7 @@ fn handle_advertisement(advertisementpacket: AdvertisementPacket, socket:&UdpSoc
 		
 		debug!("Haven't received Payload Packet yet, sending send request");	
 		let sendrequest = SendablePackets::SendRequestPacket(SendRequestPacket::new(&advertisementpacket));
-		socket.send_to(&encode(&sendrequest, SizeLimit::Infinite).unwrap(), ("255.255.255.255",port));
+		socket.send_to(&encode(&sendrequest, SizeLimit::Infinite).unwrap(), (BROADCAST_ALL,port));
 	}
 	else{
 		debug!("Already got advertised Packet, ignoring request.");
@@ -146,7 +173,7 @@ fn handle_send_request(sendrequestpacket: SendRequestPacket, socket: &UdpSocket,
 	
 		debug!("send request is targeted at us, sending packet");
 		if let Some(packet) = id_to_packet.get(&sendrequestpacket.packet) {
-		socket.send_to(&encode(&SendablePackets::PayloadPacket(packet.clone()), SizeLimit::Infinite).unwrap(), ("255.255.255.255", port));
+		socket.send_to(&encode(&SendablePackets::PayloadPacket(packet.clone()), SizeLimit::Infinite).unwrap(), (BROADCAST_ALL, port));
 		}		
 	}
 	else{
@@ -164,7 +191,7 @@ fn handle_payload(payloadpacket: PayloadPacket, socket: &UdpSocket, id_to_packet
 			let advertisement = SendablePackets::AdvertisementPacket(AdvertisementPacket::new(&payloadpacket, ip_address));
 			let advertisement_encoded = &encode(&advertisement, SizeLimit::Infinite).unwrap();
 			info!("sending {} Bytes : {:?}",advertisement_encoded.len(), advertisement_encoded);
-			socket.send_to(advertisement_encoded, ("255.255.255.255", port));
+			socket.send_to(advertisement_encoded, (BROADCAST_ALL, port));
 	}
 	else{
 		debug!("already received payload packet, ignoring");
@@ -197,7 +224,7 @@ fn worker_loop(port: u16, ip_address:i64, socket:UdpSocket, send:Receiver<Payloa
 				id_to_payload.insert(packet_id,pending_message.clone());
 			}
 		
-			match decode(&buffer[0..amount.0]) {
+			match decode(&buffer) {
 			Err(e) => error!("Cannot decode recieved Packet. Error: {}",e),
 			Ok(packet) => match packet {
 				SendablePackets::AdvertisementPacket(adv) => handle_advertisement(adv,&socket,&id_to_payload, port),
