@@ -137,6 +137,8 @@ impl PacketSender {
 			Ok(_) => debug!("Successfully sent advertisement!"),
 			Err(e) => error!("Failed to send advertisement: {}", e)
 		}
+		self.sequence_number = self.sequence_number.wrapping_add(1);
+		debug!("incremented sequence_number to {}", self.sequence_number);
 	}
 }
 
@@ -162,7 +164,7 @@ fn handle_advertisement(advertisementpacket: AdvertisementPacket, socket:&UdpSoc
 		socket.send_to(&encode(&sendrequest, SizeLimit::Infinite).unwrap(), (BROADCAST_ALL,port));
 	}
 	else{
-		debug!("Already got advertised Packet, ignoring request.");
+		debug!("Already got advertised Packet, ignoring advertisement.");
 	}
 }
 
@@ -192,15 +194,15 @@ fn handle_payload(payloadpacket: PayloadPacket, socket: &UdpSocket, id_to_packet
 			let advertisement_encoded = &encode(&advertisement, SizeLimit::Infinite).unwrap();
 			info!("sending {} Bytes : {:?}",advertisement_encoded.len(), advertisement_encoded);
 			socket.send_to(advertisement_encoded, (BROADCAST_ALL, port));
+				
+			if let Err(_) = received.send(payloadpacket.clone()) {
+				warn!("Cannot forward received PayloadPacket");
+			}
+
 	}
 	else{
 		debug!("already received payload packet, ignoring");
 	}
-	
-	if let Err(_) = received.send(payloadpacket.clone()) {
-		warn!("Cannot forward received PayloadPacket");
-	}
-	
 }
 
 fn worker_loop(port: u16, ip_address:i64, socket:UdpSocket, send:Receiver<PayloadPacket>, received:Sender<PayloadPacket>) {
