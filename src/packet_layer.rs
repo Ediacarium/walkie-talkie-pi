@@ -195,7 +195,7 @@ fn handle_payload(payloadpacket: PayloadPacket, socket: &UdpSocket, id_to_packet
     }
 }
 
-fn worker_loop(port: u16, ip_address: i64, socket: UdpSocket, send: Receiver<PayloadPacket>, received: Sender<PayloadPacket>) {
+fn worker_loop(port: u16, ip_address: i64, socket: UdpSocket, rx: Receiver<PayloadPacket>, tx: Sender<PayloadPacket>) {
     info!("worker started!");
     let mut buffer = [0; 1500];
     let mut running = true;
@@ -206,7 +206,7 @@ fn worker_loop(port: u16, ip_address: i64, socket: UdpSocket, send: Receiver<Pay
             debug!("Received a message from the socket (length: {})", amount.0);
             //empty message queue
             let mut pending_message = PayloadPacket::new(&Vec::<u8>::with_capacity(0), 0, 0);
-            while match send.try_recv() {
+            while match rx.try_recv() {
                 Ok(s) => {pending_message = s; true},
                 Err(e) => {if e == TryRecvError::Disconnected { running = false; }; false}
                 } != false {
@@ -220,7 +220,7 @@ fn worker_loop(port: u16, ip_address: i64, socket: UdpSocket, send: Receiver<Pay
                 Ok(packet) => match packet {
                     SendablePackets::AdvertisementPacket(adv) => handle_advertisement(adv, &socket, &id_to_payload, port),
                     SendablePackets::SendRequestPacket(srp) => handle_send_request(srp, &socket, &id_to_payload, ip_address, port),
-                    SendablePackets::PayloadPacket(pp) => handle_payload(pp, &socket, &mut id_to_payload, ip_address, port, &received),
+                    SendablePackets::PayloadPacket(pp) => handle_payload(pp, &socket, &mut id_to_payload, ip_address, port, &tx),
                 }
             }
         }
