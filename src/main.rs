@@ -54,7 +54,7 @@ fn main() {
         None => 1000
     };
 
-    let config = audio::AudioConfig { devname: "plughw:Set", num_channels: 1, sample_rate: 44100, buf_len: buf_len };
+    let config = audio::AudioConfig { devname: "default", num_channels: 1, sample_rate: 44100, buf_len: buf_len };
 
     let port = 1337;
     let addr = rng.gen();
@@ -75,19 +75,25 @@ fn main() {
     	loop {
     		let ((sender, data), addr, _) = rx.receive().unwrap();
     		if let None = known_senders.get(&sender) {
-	            let ring = RingBuffer::new(4);
+	            let ring = RingBuffer::new(10);
     			buffer_mutex_write.lock().unwrap().add_client(sender, ring);
     			known_senders.insert(sender, ());
     		}
 			buffer_mutex_write.lock().unwrap().store_data(sender, data);
-			
     	}
     });
 
-    //audio::Player::spawn_play_thread(&config, buffer_mutex_play);
     let recorder = audio::Recorder::new(&config).unwrap();
     let sender = rng.gen();
-   	recorder.record(|data| {tx.send((sender, data)); });
+	thread::spawn(move || {
+		recorder.record(|data| {tx.send((sender, data)); });
+	});
+
+	std::thread::sleep(std::time::Duration::from_millis(delay));
+    audio::Player::spawn_play_thread(&config, buffer_mutex_play);
+	loop{
+		std::thread::sleep(std::time::Duration::from_millis(20000));
+    }
 	
     /*thread::spawn(move || {
         loop {
