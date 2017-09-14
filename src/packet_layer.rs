@@ -205,7 +205,7 @@ fn handle_payload<P>(payloadpacket: PayloadPacket<P>, socket: &UdpSocket, id_to_
 fn worker_loop<P>(port: u16, ip_address: i64, socket: UdpSocket, rx: Receiver<PayloadPacket<P>>, tx: Sender<PayloadPacket<P>>) 
 	where P: Clone + DeserializeOwned + Serialize{
     info!("worker started!");
-    let mut buffer: [u8; 1500] = [0; 1500];
+    let mut buffer = [0; 4*10240];
     let mut running = true;
     let mut id_to_payload = HashMap::new();
 
