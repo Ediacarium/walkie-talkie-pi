@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::io::Error as IOError;
 
 static IP_ADDR_ANY : &'static str = "0.0.0.0";
-static BROADCAST_ALL : &'static str = "255.255.255.255";
+static BROADCAST_ALL : &'static str = "192.168.1.255";
 
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, Clone, Hash)]
