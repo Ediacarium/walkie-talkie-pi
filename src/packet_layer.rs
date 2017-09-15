@@ -2,7 +2,7 @@
 
 use std::vec::Vec;
 use std::clone::Clone;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::marker::Send;
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread;
@@ -13,13 +13,13 @@ use serde::de::DeserializeOwned;
 use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::RecvError;
 use std::sync::Arc;
-use std::net::UdpSocket;
-use std::net::Ipv4Addr;
+use std::net::{UdpSocket, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::io::Error as IOError;
 
 static IP_ADDR_ANY : &'static str = "0.0.0.0";
-static BROADCAST_ALL : &'static str = "192.168.1.255";
+static BROADCAST_ALL : &'static str = "255.255.255.255";
+const MAX_PACKETS_STORED: usize = 200;
 
 
 #[derive(Deserialize, Serialize, PartialEq, Eq, Clone, Hash)]
@@ -55,14 +55,12 @@ impl AdvertisementPacket {
 #[derive(Deserialize, Serialize, PartialEq, Eq, Clone, Hash)]
 pub struct SendRequestPacket {
     packet: PacketId,
-    favoured_sender: i64,
 }
 
 impl SendRequestPacket {
     pub fn new(packet: &AdvertisementPacket) -> Self {
         SendRequestPacket {
             packet: packet.packet.clone(),
-            favoured_sender: packet.advertiser,
         }
     }
 }
@@ -158,37 +156,40 @@ pub fn packet_layer<P: 'static>(port: u16, ip_address:i64) -> Result<(PacketSend
     }))
 }
 
-fn handle_advertisement<P>(advertisementpacket: AdvertisementPacket, socket: &UdpSocket, id_to_packet: &HashMap<PacketId, PayloadPacket<P>>, port: u16) 
+fn handle_advertisement<P>(advertisementpacket: AdvertisementPacket, socket: &UdpSocket, id_to_packet: &HashMap<PacketId, PayloadPacket<P>>, source: SocketAddr) 
 	where P:Serialize {
     info!("handling advertisement packet");
     if let None =  id_to_packet.get(&advertisementpacket.packet) {
         debug!("Haven't received Payload Packet yet, sending send request");
         let sendrequest : SendablePackets<P> = SendablePackets::SendRequestPacket(SendRequestPacket::new(&advertisementpacket));
-        socket.send_to(&serialize(&sendrequest, Infinite).unwrap(), (BROADCAST_ALL, port));
+        socket.send_to(&serialize(&sendrequest, Infinite).unwrap(), source);
     } else {
         debug!("Already got advertised Packet, ignoring advertisement.");
     }
 }
 
-fn handle_send_request<P>(sendrequestpacket: SendRequestPacket, socket: &UdpSocket, id_to_packet: &HashMap<PacketId, PayloadPacket<P>>, ip_address: i64, port: u16) 
+fn handle_send_request<P>(sendrequestpacket: SendRequestPacket, socket: &UdpSocket, id_to_packet: &HashMap<PacketId, PayloadPacket<P>>, source: SocketAddr) 
 	where P: Clone + Serialize{
     info!("handling send request packet");
-    if sendrequestpacket.favoured_sender == ip_address {
-        debug!("send request is targeted at us, sending packet");
-        if let Some(packet) = id_to_packet.get(&sendrequestpacket.packet) {
-            socket.send_to(&serialize(&SendablePackets::PayloadPacket(packet.clone()), Infinite).unwrap(), (BROADCAST_ALL, port));
-        }
+    if let Some(packet) = id_to_packet.get(&sendrequestpacket.packet) {
+        socket.send_to(&serialize(&SendablePackets::PayloadPacket(packet.clone()), Infinite).unwrap(), source);
     } else {
-        debug!("send request is not targeted at us, ignoring");
+        debug!("failed to find requested packet, ignoring");
     }
 }
 
-fn handle_payload<P>(payloadpacket: PayloadPacket<P>, socket: &UdpSocket, id_to_packet: &mut HashMap<PacketId, PayloadPacket<P>>, ip_address: i64, port: u16, received: &Sender<PayloadPacket<P>>) 
+fn handle_payload<P>(payloadpacket: PayloadPacket<P>, socket: &UdpSocket, id_to_packet: &mut HashMap<PacketId, PayloadPacket<P>>, id_age: &mut VecDeque<PacketId>, ip_address: i64, port: u16, received: &Sender<PayloadPacket<P>>) 
 	where P: Clone + Serialize {
     info!("handling payload packet");
     if let None = id_to_packet.get(&payloadpacket.packet) {
         debug!("haven't gotten payload packet, saving");
+        
         id_to_packet.insert(payloadpacket.packet.clone(), payloadpacket.clone());
+		id_age.push_back(payloadpacket.packet.clone());
+		if id_age.len() > MAX_PACKETS_STORED {
+			id_to_packet.remove(&id_age.pop_front().unwrap());
+		}
+
         let advertisement : SendablePackets<P> = SendablePackets::AdvertisementPacket(AdvertisementPacket::new(&payloadpacket, ip_address));
         let advertisement_encoded = &serialize(&advertisement, Infinite).unwrap();
         info!("sending {} Bytes : {:?}", advertisement_encoded.len(), advertisement_encoded);
@@ -208,10 +209,11 @@ fn worker_loop<P>(port: u16, ip_address: i64, socket: UdpSocket, rx: Receiver<Pa
     let mut buffer = [0; 4*10240];
     let mut running = true;
     let mut id_to_payload = HashMap::new();
+    let mut id_age = VecDeque::with_capacity(MAX_PACKETS_STORED);
 
     while running {
-        if let Ok(amount) = socket.recv_from(&mut buffer) {
-            debug!("Received a message from the socket (length: {})", amount.0);
+        if let Ok((amount, source)) = socket.recv_from(&mut buffer) {
+            debug!("Received a message from the socket (length: {})", amount);
             //empty message queue
             
             while let Ok(pending_message) = rx.try_recv() {
@@ -226,9 +228,9 @@ fn worker_loop<P>(port: u16, ip_address: i64, socket: UdpSocket, rx: Receiver<Pa
             match deserialize(&buffer) {
                 Err(e) => error!("Cannot decode recieved Packet. Error: {}", e),
                 Ok(packet) => match packet {
-                    SendablePackets::AdvertisementPacket(adv) => handle_advertisement(adv, &socket, &id_to_payload, port),
-                    SendablePackets::SendRequestPacket(srp) => handle_send_request(srp, &socket, &id_to_payload, ip_address, port),
-                    SendablePackets::PayloadPacket(pp) => handle_payload(pp, &socket, &mut id_to_payload, ip_address, port, &tx),
+                    SendablePackets::AdvertisementPacket(adv) => handle_advertisement(adv, &socket, &id_to_payload, source),
+                    SendablePackets::SendRequestPacket(srp) => handle_send_request(srp, &socket, &id_to_payload, source),
+                    SendablePackets::PayloadPacket(pp) => handle_payload(pp, &socket, &mut id_to_payload, &mut id_age, ip_address, port, &tx),
                 }
             }
         }
