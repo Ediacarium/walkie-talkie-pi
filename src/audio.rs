@@ -2,157 +2,185 @@ use std::collections::HashMap;
 use std::thread;
 use std::sync;
 use std::ffi::CString;
-use std::clone::Clone;
 use std;
 use alsa::{Direction, ValueOr};
 use alsa::pcm::{PCM, HwParams, Format, Access, Frames};
-use bincode::{serialize, deserialize};
 
-#[derive(Deserialize, Serialize, Clone)]
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AudioData {
-    pub buf: Vec<i16>,
-    pub id: usize,
+    pub client_id: u16,
+    pub pos: u64,    // pos must be > 0 (because position 0 is considered to be initial (unset) value
+    pub data: Vec<i16>,
 }
 
 pub struct RingBuffer {
-    ring: Vec<AudioData>,
-    ring_size: usize,
-    next: usize,
-    max: usize,
+    buf: Vec<i16>,
+    next: u64,  // points to first element to read next, i.e. buf[next] was not yet read
+    max: u64,   // points to the last filled element, i.e. buf[max] is set
+    spare: u64, // number of samples to always keep in buffer
 }
 
 impl RingBuffer {
-    pub fn new(ring_size: usize) -> RingBuffer {
-        let mut ring: Vec<AudioData> = Vec::new();
-        for _ in 0..ring_size {
-            ring.push(AudioData { buf: vec![], id: 0});
-        }
-        RingBuffer { ring: ring, ring_size: ring_size, max: 0, next: 1 }
+    pub fn new(buf_len: u32, spare: u64) -> RingBuffer {
+        assert!(spare < buf_len as u64);
+        RingBuffer { buf: vec![0_i16;buf_len as usize], max: 0, next: 0, spare: spare }
     }
 
-    fn visualize_ring(&self) {
-        if self.ring[self.next % self.ring_size].id == self.next {
-            print!("{}", self.next);
+    pub fn get_next(&mut self, target_len: u64) -> Option<Vec<i16>> {
+        assert!(self.spare + target_len < self.buf.len() as u64);
+        trace!("ringbuffer: next {} max {} spare {} len {}", self.next, self.max, self.spare, self.buf.len());
+        let buf_len = self.buf.len() as u64;
+        // TODO: Combine if clauses (added to have debug output only)
+        if self.max == 0 {
+            trace!("no data yet added");
+            return None;
         }
-        else {
-            print!("({})", self.next);
-        }            
-        for i in 1..self.ring_size {
-            let index = (i + self.next) % self.ring_size;
-            if i + self.next < self.max {
-                if self.ring[index].id == i + self.next {
-                    print!("+");
-                }
-                else {
-                    print!(".");
-                }
-            }
-            else if i + self.next == self.max {
-                print!("<{}>", self.max);
+        if self.max < self.spare {
+            trace!("not enough data added yet");
+            return None;
+        }
+        if self.next == 0 {
+            // first call -> set self.next to some sensitive value
+            self.next = if self.max < buf_len {
+                1
             }
             else {
-                print!(".");
-            }
+                self.max - buf_len + 1
+            };
+            trace!("First call, adjusting next to {}", self.next);
         }
-        println!("");
-    }
-    
-    pub fn get_next(&mut self) -> Option<&AudioData> {
-        // At this point we may update next towards max in order to reduce delay
-        print!("ring: "); self.visualize_ring();
-        let index = self.next % self.ring_size;
-        let result = if self.ring[index].id == self.next {
-            println!("get_next(): return id {} at index {} with max {}", self.next, index, self.max);
-            Some(&self.ring[index])
+        if self.next > self.max - self.spare {
+            trace!("not enough spare data");
+            return None;
+        }
+        let max_avail = ((self.max - self.spare) + 1) - self.next;   // Do not change computation order to prevent underflow!
+        let len = if max_avail < target_len {
+            max_avail
         }
         else {
-            println!("get_next(): no data found for id {} with max {}, returning None", self.next, self.max);
-            None
+            target_len
         };
-        self.next = self.next + 1;  // TODO: What if we get beyond max?
-        result
+        assert!(len > 0);
+        //let mut result = Vec::<i16>::with_capacity(len as usize);
+        let mut result = vec![0_i16;len as usize];
+        let start = (self.next % buf_len) as usize;
+        let mut end_excl = ((self.next + len) % buf_len) as usize;  // buf[end_excl] is the first element not to be returned.
+        if end_excl == 0 {
+            end_excl = (buf_len + 1) as usize;
+        }
+        if start < end_excl {
+            // current bucket does not exceed buf size, thus we may copy in one piece:
+            trace!("get_next(): copy1 [0..{}] <- [{}..{}]", len, start, end_excl);
+            &result[0..len as usize].copy_from_slice(&self.buf[start..end_excl]);  // note: start..end excludes the element at end_excl
+        }
+        else {
+            // current bucket exceeds buf size, thus copy in two pieces:
+            let len_first_part = buf_len as usize - start;
+            trace!("get_next(): copy2 [0..{}] <- [{}..{}]", len_first_part, start, buf_len);
+            trace!("get_next(): copy2 [{}..{}] <- [0..{}]", len_first_part, len, end_excl);
+            &result[0..len_first_part].copy_from_slice(&self.buf[start..buf_len as usize]);
+            &result[len_first_part..len as usize].copy_from_slice(&self.buf[0..end_excl]);
+        }
+        self.next = self.next + len;
+        Some(result)
     }
 
-    fn store_data(&mut self, data: AudioData) {
-        if data.id < self.next {
-            println!("Received id {} is too old. Ignoring", data.id);
-            return;
+    fn store_data(&mut self, data: AudioData) -> Result<Option<()>, String> {
+        let buf_len = self.buf.len() as u64;
+        assert!(data.data.len() < buf_len as usize);
+        if (self.next > 0) && (self.next >= data.pos + data.data.len() as u64) {
+            trace!("data with pos {} and length {} is beyond next at {}", data.pos, data.data.len(), self.next);
+            return Ok(None);
         }
-        let index = data.id % self.ring_size;
-        print!("Receiving id {}, will be filled at index {}.", data.id, index);
-        if data.id > self.max {
-            let delta = data.id - self.next;
-            if delta >= self.ring_size {
-                let oldnext = self.next;
-                self.next = data.id - self.ring_size + 1;
-                print!(" Beyond ring capactiy, setting next from {} to {}.", oldnext, self.next);
-            }
-            print!(" Advancing max to {}, next is {}.", data.id, self.next);
-            self.max = data.id;
+        if (self.max > 0) && (data.pos <= self.max) && (data.pos + data.data.len() as u64 > self.max) {
+            trace!("error: data with pos {} and length {} crosses max at {}", data.pos, data.data.len(), self.max);
+            return Err("mismatch data pos and len: Crosses max.".to_string());
         }
-        println!(" Spare capacity is {}", self.ring_size - (self.max - self.next) - 1);
-        self.ring[index] = data;
-     }
-
+        let len = data.data.len();
+        let start = (data.pos % buf_len) as usize;
+        let mut end_excl = ((data.pos + data.data.len() as u64) % buf_len) as usize;
+        if end_excl == 0 {
+            end_excl = (buf_len + 1) as usize;
+        }
+        trace!("store_data(): start {}, end_excl {}", start, end_excl);
+        if start < end_excl {
+            // current bucket does not exceed buf size, thus we may copy in one piece:
+            trace!("store_data(): copy1 [{}..{}] <- [0..{}]", start, end_excl, len);
+            &self.buf[start..end_excl].copy_from_slice(&data.data[0..len as usize]);
+        }
+        else {
+            // current bucket exceeds buf size, thus copy in two pieces:
+            let len_first_part = (buf_len - start as u64) as usize;
+            trace!("store_data(): copy2 [{}..{}] <- [0..{}]", start, buf_len, len_first_part);
+            trace!("store_data(): copy2 [0..{}] <- [{}..{}]", end_excl, len_first_part, len);
+            &self.buf[start..buf_len as usize].copy_from_slice(&data.data[0..len_first_part]);
+            &self.buf[0..end_excl].copy_from_slice(&data.data[len_first_part..len as usize]);
+        }
+        if data.pos > self.max {  // Note: as data does not cross max (see check above), this condition is sufficient
+            self.max = data.pos + data.data.len() as u64 - 1;
+            trace!("new max: {}", self.max);
+        }
+        if self.max - self.next >= buf_len {
+            // TODO: Set self.next to which value here?
+            self.next = self.max - buf_len + 1;
+            trace!("next overrun to {}", self.next);
+        }
+        return Ok(Some(()));
+    }
 
 }
 
 // ========================================
 
 pub struct AudioBuffer {
-    buf_size: usize,
-    rings: HashMap<usize, RingBuffer>,
+    buf_len: u32,
+    spare: u64,
+    rings: HashMap<u16, RingBuffer>,
 }
 
 impl AudioBuffer {
-    // buf_size is needed in order to create silence and temp buffer
-    pub fn new(buf_size: usize) -> AudioBuffer {
-        AudioBuffer {buf_size: buf_size, rings: HashMap::new()}
+    // buf_len is needed in order to create silence and temp buffer
+    pub fn new(buf_len: u32, spare: u64) -> AudioBuffer {
+        AudioBuffer {buf_len: buf_len, spare: spare, rings: HashMap::new()}
     }
 
-    pub fn add_client(&mut self, client_id: usize, ring: RingBuffer) {
-        self.rings.insert(client_id, ring);
-    }
-
-    #[allow(dead_code)]
-    pub fn rm_client(&mut self, client_id: usize) {
-        match self.rings.remove(&client_id) {
-            Some(_) => println!("rm_client: Successfully removed {}", client_id),
-            None => println!("rm_client: called for {} which does not exist!", client_id)
+    pub fn store_data(&mut self, data: AudioData) -> Result<Option<()>, String> {
+        // TODO: Detect buffer that do not receive any more data
+        // Note: Since we automatically add new clients, each client will use a ringbuffer with the same configuration
+        if ! self.rings.contains_key(&data.client_id) {
+            trace!("store_data() called for non-existing client id {}", data.client_id);
+            self.rings.insert(data.client_id, RingBuffer::new(self.buf_len, self.spare));
+        }
+        match self.rings.get_mut(&data.client_id) {
+            Some(buffer) => buffer.store_data(data),
+            None => panic!("where is the client gone?!?")
         }
     }
-    
-    pub fn store_data(&mut self, client_id: usize, data: AudioData) -> bool {
-        match self.rings.get_mut(&client_id) {
-            Some(buffer) => buffer.store_data(data),
-            None => {
-                println!("store_data() called for non-existing client id {}", client_id);
-                return false
-            }
-        };
-        true
-    }
 
-    pub fn get_next(&mut self) -> Vec<i16> {
-        let mut vec = vec![0_i16;self.buf_size];
+    pub fn get_next(&mut self, len: u32) -> Vec<i16> {
+        let mut vec = vec![0_i16;len as usize];
         let mut count = 0;
         // Adding all buffers:
         for (_, buffer) in &mut self.rings {
-            //println!("Calling get_next() for client {}:", id);
-            let data = match buffer.get_next() {
+            //trace!("Calling get_next() for client {}:", id);
+            let data = match buffer.get_next(len as u64) {
                 Some(data) => data,
                 None => {
-                    println!(" No data.");
+                    trace!("No data.");
                     continue
                 }
             };
-            //println!(" Got data for client {}", id);
+            //trace!(" Got data for client {}", id);
             count = count + 1;
-            for (pos, val) in data.buf.iter().enumerate() {
-                //println!("Adding {} to {} at pos {}", *val, vec[pos], pos);
+            for (pos, val) in data.iter().enumerate() {
+                //trace!("Adding {} to {} at pos {}", *val, vec[pos], pos);
                 vec[pos] += *val;
             }
-            //println!("done");
+            //trace!("done");
+        }
+        if self.rings.len() == 0 {
+            trace!("no ringbuffers added yet");
         }
         // Scaling:
         if count > 1 {
@@ -171,7 +199,6 @@ pub struct AudioConfig<'a> {
     pub devname: &'a str,
     pub num_channels: u32,
     pub sample_rate: u32,
-    pub buf_len: usize,
 }
 
 // ========================================
@@ -192,11 +219,11 @@ impl Player {
             hwp.set_channels(config.num_channels)?;
             sample_rate = hwp.set_rate_near(config.sample_rate, ValueOr::Nearest)?;
             if sample_rate != config.sample_rate {
-                println!("Sample rate was changed from {} to {}", config.sample_rate, sample_rate);
+                trace!("Sample rate was changed from {} to {}", config.sample_rate, sample_rate);
             }
             hwp.set_format(Format::s16())?;
             hwp.set_access(Access::RWInterleaved)?;
-            println!("Buffersize: {:?}", hwp.get_buffer_size());
+            trace!("Buffersize: {:?}", hwp.get_buffer_size());
             pcm.hw_params(&hwp)?;
         };
         pcm.prepare()?;
@@ -207,7 +234,7 @@ impl Player {
         let total = match self.pcm.status() {
             Ok(val) => val.get_avail_max(),
             Err(e) => {
-                println!("******ERROR: get_avail_max() returned error {}", e);
+                trace!("******ERROR: get_avail_max() returned error {}", e);
                 self.pcm.prepare().unwrap();
                 return 0  // TODO: Is this OK?
             }
@@ -218,36 +245,36 @@ impl Player {
         let avail = match self.pcm.avail_update() {
             Ok(val) => val,
             Err(e) => {
-                println!("******ERROR: avail_update returned error {}, call prepare", e);
+                trace!("******ERROR: avail_update returned error {}, call prepare", e);
                 self.pcm.prepare().unwrap();
                 return 0
             }
         };
-        println!("Current audio buffer status: total: {}, avail: {}, total-avail {}", total, avail, total-avail);
+        trace!("Current audio buffer status: total: {}, avail: {}, total-avail {}", total, avail, total-avail);
         total - avail
     }
     
     pub fn play(&self, data: Vec<i16>) {
         let io = self.pcm.io_i16().unwrap();
-        println!("calling writei");
+        trace!("calling writei");
         io.writei(&data[..]).unwrap();
     }
 
-    pub fn spawn_play_thread(config: &AudioConfig, buffer_mutex_play: sync::Arc<sync::Mutex<AudioBuffer>>) {
-        println!("Spawning play thread");
+    pub fn spawn_play_thread(config: &AudioConfig, read_bucket_len: u32, buffer_mutex_play: sync::Arc<sync::Mutex<AudioBuffer>>) {
+        trace!("Spawning play thread");
         let player = Player::new(config).unwrap();
-        let delay = 900.0 * (config.buf_len as f32/ config.sample_rate as f32 );
-        let threshold = (1.5 * config.buf_len as f32) as Frames;
-        println!("delay {}, threshold {}", delay as u64, threshold);
+        let delay = 900.0 * (read_bucket_len as f32/ config.sample_rate as f32 );
+        let threshold = (1.5 * read_bucket_len as f32) as Frames;
+        trace!("delay {}, threshold {}", delay as u64, threshold);
         thread::spawn(move || {
             loop {
                 while player.get_remain() < threshold {
-                    println!("Player needs more data, thus calling get_next() and play()");
-                    let data = buffer_mutex_play.lock().unwrap().get_next();
+                    trace!("Player needs more data, thus calling get_next() and play()");
+                    let data = buffer_mutex_play.lock().unwrap().get_next(read_bucket_len);
                     player.play(data);
                 }
                 // TODO: Adapt sleep time
-                println!("Ready to sleep");
+                trace!("Ready to sleep");
                 
                 std::thread::sleep(std::time::Duration::from_millis(delay as u64));
             }
@@ -262,12 +289,12 @@ impl Player {
 pub struct Recorder {
     pcm: PCM,
     sample_rate: u32,  // currently not used
-    buf_len: usize,
+    client_id: u16
 }
 
 impl Recorder {
 
-    pub fn new(config: &AudioConfig) -> Result<Recorder, Box<std::error::Error>> {
+    pub fn new(config: &AudioConfig, client_id: u16) -> Result<Recorder, Box<std::error::Error>> {
         let cs = CString::new(config.devname)?;
         let pcm = PCM::open(&*cs, Direction::Capture, false)?;
         let sample_rate;
@@ -277,39 +304,40 @@ impl Recorder {
             hwp.set_channels(config.num_channels)?;
             sample_rate = hwp.set_rate_near(config.sample_rate, ValueOr::Nearest)?;
             if sample_rate != config.sample_rate {
-                println!("Sample rate was changed from {} to {}", config.sample_rate, sample_rate);
+                trace!("Sample rate was changed from {} to {}", config.sample_rate, sample_rate);
             }
             hwp.set_format(Format::s16())?;
             hwp.set_access(Access::RWInterleaved)?;
             pcm.hw_params(&hwp)?;
         }
-        Ok(Recorder { pcm : pcm, sample_rate : sample_rate, buf_len : config.buf_len })
+        Ok(Recorder { pcm : pcm, sample_rate : sample_rate, client_id: client_id })
     }
 
     // TODO: To allow mut code in closure, we have to declare F here as FnMut, not Fn. Is this OK?
-    pub fn record<F>(& self, mut callback: F) -> Result<(), Box<std::error::Error>>
+    pub fn record<F>(&self, write_bucket_len: u64, mut callback: F) -> Result<(), Box<std::error::Error>>
         where F : FnMut(AudioData) -> ()
     {
-        println!("record() start");
+        trace!("record() start");
         self.pcm.prepare()?;
         let io = self.pcm.io_i16()?;
-        let mut i = 0;
+        let mut i: u64 = 1;
         loop {
-            i = i + 1;
-            let mut data = AudioData{ buf: vec![0_i16; self.buf_len], id: i };
-            io.readi(&mut data.buf[..])?;
+            let mut data = AudioData{ data: vec![0_i16; write_bucket_len as usize], pos: i, client_id: self.client_id };
+            io.readi(&mut data.data[..])?;
             callback(data);
+            i = i + write_bucket_len;
         }
     }
 
-    pub fn spawn_record_thread(config: &AudioConfig, client_id: usize, buffer_mutex_write: sync::Arc<sync::Mutex<AudioBuffer>>) {
-        println!("Spawning record thread");
-        let recorder = Recorder::new(config).unwrap();
+    pub fn spawn_record_thread(config: &AudioConfig, client_id: u16, write_bucket_len: u64, buffer_mutex_write: sync::Arc<sync::Mutex<AudioBuffer>>) {
+        trace!("Spawning record thread");
+        let recorder = Recorder::new(config, client_id).unwrap();
         thread::spawn(move || {
-            let ring = RingBuffer::new(120);
-            buffer_mutex_write.lock().unwrap().add_client(client_id, ring);
-            recorder.record(|data| {
-                buffer_mutex_write.lock().unwrap().store_data(client_id, data);
+            recorder.record(write_bucket_len, |data| {
+                match buffer_mutex_write.lock().unwrap().store_data(data) {
+                    Ok(_) => {},
+                    Err(e) => {trace!("Could not store: {:?}", e)}
+                };
             }).unwrap();
         });
     }
