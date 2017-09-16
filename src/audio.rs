@@ -49,11 +49,11 @@ impl RingBuffer {
 //                self.max - buf_len + 1
 //            };
 
-            self.next = if self.max > self.spare {
-                self.max - self.spare
+            self.next = if self.max > self.spare + target_len {
+                self.max - self.spare -target_len
             }
             else {
-                1
+                1  // TODO
             };
 
             trace!("First call, adjusting next to {}", self.next);
@@ -267,7 +267,14 @@ impl Player {
     pub fn play(&self, data: Vec<i16>) {
         let io = self.pcm.io_i16().unwrap();
         trace!("calling writei");
-        io.writei(&data[..]).unwrap();
+        match io.writei(&data[..]) {
+            Ok(_) => {},
+            Err(err) => {
+                trace!("writei caused error: {}. Writing again.", err);
+                self.pcm.prepare().unwrap();
+                io.writei(&data[..]).unwrap();
+            }
+        }
     }
 
     pub fn spawn_play_thread(config: &AudioConfig, read_bucket_len: u32, buffer_mutex_play: sync::Arc<sync::Mutex<AudioBuffer>>) {
