@@ -29,7 +29,7 @@ impl RingBuffer {
 
     pub fn get_next(&mut self, target_len: u64) -> Option<Vec<i16>> {
         assert!(self.spare + target_len < self.buf.len() as u64);
-        trace!("ringbuffer: next {} max {} spare {} len {}", self.next, self.max, self.spare, self.buf.len());
+        trace!("ringbuffer: next {}/{} max {}/{} spare {} len {}", self.next, self.next % self.buf.len() as u64, self.max, self.max % self.buf.len() as u64, self.spare, self.buf.len());
         let buf_len = self.buf.len() as u64;
         // TODO: Combine if clauses (added to have debug output only)
         if self.max == 0 {
@@ -42,12 +42,20 @@ impl RingBuffer {
         }
         if self.next == 0 {
             // first call -> set self.next to some sensitive value
-            self.next = if self.max < buf_len {
-                1
+//            self.next = if self.max < buf_len {
+//                1
+//            }
+//            else {
+//                self.max - buf_len + 1
+//            };
+
+            self.next = if self.max > self.spare {
+                self.max - self.spare
             }
             else {
-                self.max - buf_len + 1
+                1
             };
+
             trace!("First call, adjusting next to {}", self.next);
         }
         if self.next > self.max - self.spare {
@@ -121,7 +129,7 @@ impl RingBuffer {
             self.max = data.pos + data.data.len() as u64 - 1;
             trace!("new max: {}", self.max);
         }
-        if self.max - self.next >= buf_len {
+        if (self.next != 0) && (self.max - self.next >= buf_len) {
             // TODO: Set self.next to which value here?
             self.next = self.max - buf_len + 1;
             trace!("next overrun to {}", self.next);
@@ -158,9 +166,14 @@ impl AudioBuffer {
         }
     }
 
-    pub fn get_next(&mut self, len: u32) -> Vec<i16> {
+    pub fn get_next(&mut self, len: u32) -> Option<Vec<i16>> {
         let mut vec = vec![0_i16;len as usize];
         let scaling = self.rings.len() as i16;
+        let mut some = false;
+        if self.rings.len() == 0 {
+            trace!("no ringbuffers added yet");
+            return None;
+        }
         // Adding all buffers:
         for (_, buffer) in &mut self.rings {
             //trace!("Calling get_next() for client {}:", id);
@@ -171,6 +184,7 @@ impl AudioBuffer {
                     continue
                 }
             };
+            some = true;
             //trace!(" Got data for client {}", id);
             for (pos, val) in data.iter().enumerate() {
                 //trace!("Adding {} to {} at pos {}", *val, vec[pos], pos);
@@ -178,10 +192,13 @@ impl AudioBuffer {
             }
             //trace!("done");
         }
-        if self.rings.len() == 0 {
-            trace!("no ringbuffers added yet");
+        if some {
+            trace!("get_next() returns valid data");
+            Some(vec)
         }
-        vec
+        else {
+            None
+        }
     }
 
 }
@@ -263,7 +280,13 @@ impl Player {
             loop {
                 while player.get_remain() < threshold {
                     trace!("Player needs more data, thus calling get_next() and play()");
-                    let data = buffer_mutex_play.lock().unwrap().get_next(read_bucket_len);
+                    let data = match buffer_mutex_play.lock().unwrap().get_next(read_bucket_len) {
+                        Some(data) => data,
+                        None => {
+                            trace!("Player returns no data, so do not play data");
+                            break;
+                        }
+                    };
                     player.play(data);
                 }
                 // TODO: Adapt sleep time

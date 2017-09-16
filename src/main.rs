@@ -40,6 +40,7 @@ fn main() {
     opts.optopt("w", "write-bucket-size", "set bucket size in bytes for writes to ring buffer", "SIZE");
     opts.optopt("s", "spare-size", "set size in bytes of spare area in ring buffer", "SIZE");
     opts.optopt("d", "delay", "set delay in ms", "DELAYMS");
+    opts.optopt("a", "audio-device", "set name of audio-device", "NAME");
     opts.optflag("h", "help", "print this help menu");
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -69,8 +70,13 @@ fn main() {
         Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
         None => 1000
     };
+    let devname = match matches.opt_str("a") {
+        Some(val) => val,
+        None => "default".to_string()
+    };
 
-    let config = audio::AudioConfig { devname: "plughw:Set", num_channels: 1, sample_rate: 44100 };
+    //let config = audio::AudioConfig { devname: "plughw:Set", num_channels: 1, sample_rate: 44100 };
+    let config = audio::AudioConfig { devname: &devname, num_channels: 1, sample_rate: 44100 };
 
     let port = 1337;
     let addr = rng.gen();
@@ -93,9 +99,9 @@ fn main() {
     	}
     });
 
-    let recorder = audio::Recorder::new(&config, rng.gen()).unwrap();
     audio::Player::spawn_play_thread(&config, read_bucket_len, buffer_mutex_play);
     //thread::spawn(move || {
+    let recorder = audio::Recorder::new(&config, rng.gen()).unwrap();
     recorder.record(write_bucket_len, |data| {tx.send(data); });
     //});
     //loop{
