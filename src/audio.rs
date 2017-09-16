@@ -160,7 +160,7 @@ impl AudioBuffer {
 
     pub fn get_next(&mut self, len: u32) -> Vec<i16> {
         let mut vec = vec![0_i16;len as usize];
-        let mut count = 0;
+        let scaling = self.rings.len() as i16;
         // Adding all buffers:
         for (_, buffer) in &mut self.rings {
             //trace!("Calling get_next() for client {}:", id);
@@ -172,21 +172,14 @@ impl AudioBuffer {
                 }
             };
             //trace!(" Got data for client {}", id);
-            count = count + 1;
             for (pos, val) in data.iter().enumerate() {
                 //trace!("Adding {} to {} at pos {}", *val, vec[pos], pos);
-                vec[pos] += *val;
+                vec[pos] += *val / scaling;
             }
             //trace!("done");
         }
         if self.rings.len() == 0 {
             trace!("no ringbuffers added yet");
-        }
-        // Scaling:
-        if count > 1 {
-            for data in &mut vec {
-                *data = *data / count;
-            }
         }
         vec
     }
