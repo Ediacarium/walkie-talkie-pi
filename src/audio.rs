@@ -109,10 +109,12 @@ impl RingBuffer {
         if end_excl == 0 {
             end_excl = (buf_len + 1) as usize;
         }
+        let zero = vec![0_i16;target_len as usize];
         if start < end_excl {
             // current bucket does not exceed buf size, thus we may copy in one piece:
             trace!("get_next(): copy1 [0..{}] <- [{}..{}]", target_len, start, end_excl);
             &result[0..target_len as usize].copy_from_slice(&self.buf[start..end_excl]);  // note: start..end excludes the element at end_excl
+            &self.buf[start..end_excl].copy_from_slice(&zero[0..target_len as usize]);  // note: start..end excludes the element at end_excl
         }
         else {
             // current bucket exceeds buf size, thus copy in two pieces:
@@ -120,7 +122,9 @@ impl RingBuffer {
             trace!("get_next(): copy2 [0..{}] <- [{}..{}]", len_first_part, start, buf_len);
             trace!("get_next(): copy2 [{}..{}] <- [0..{}]", len_first_part, target_len, end_excl);
             &result[0..len_first_part].copy_from_slice(&self.buf[start..buf_len as usize]);
+            &self.buf[start..buf_len as usize].copy_from_slice(&zero[0..len_first_part]);
             &result[len_first_part..target_len as usize].copy_from_slice(&self.buf[0..end_excl]);
+            &self.buf[0..end_excl].copy_from_slice(&zero[len_first_part..target_len as usize]);
         }
         self.next = self.next + target_len;
         Some(result)
