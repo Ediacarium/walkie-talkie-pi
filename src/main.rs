@@ -71,7 +71,7 @@ fn main() {
     };
     let read_bucket_len = match matches.opt_str("r") {
         Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
-        None => 10000
+        None => 4000
     };
     let write_bucket_len = match matches.opt_str("w") {
         Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
@@ -79,7 +79,7 @@ fn main() {
     };
     let spare_len = match matches.opt_str("s") {
         Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
-        None => 1400 * 20
+        None => 20000
     };
     let delay = match matches.opt_str("d") {
         Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
