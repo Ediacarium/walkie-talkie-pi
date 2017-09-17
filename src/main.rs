@@ -112,7 +112,6 @@ fn main() {
     thread::spawn(move || {
     	loop {
     	    let (data, _, _) = rx.receive().unwrap();
-            println!("about to write to buffer");
 	    buffer_mutex_write.lock().unwrap().store_data(data);
     	}
     });
