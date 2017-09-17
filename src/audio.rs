@@ -8,6 +8,7 @@ use std::ffi::CString;
 use std;
 use alsa::{Direction, ValueOr};
 use alsa::pcm::{PCM, HwParams, Format, Access, Frames};
+use std::time::Instant;
 
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -23,39 +24,54 @@ pub struct RingBuffer {
     min: u64,   // points to the first filled element as long as next == 0
     max: u64,   // points to the last filled element, i.e. buf[max] is set
     spare: u64, // number of samples to always keep in buffer
+    last_update: Instant,
+}
+
+enum PeekState {
+    Ignore,
+    Avail(u64),
+    Idle,
+    None
 }
 
 impl RingBuffer {
     pub fn new(buf_len: u32, spare: u64) -> RingBuffer {
         assert!(spare < buf_len as u64);
-        RingBuffer { buf: vec![0_i16;buf_len as usize], max: 0, next: 0, spare: spare, min: 0}
+        RingBuffer { buf: vec![0_i16;buf_len as usize], max: 0, next: 0, spare: spare, min: 0, last_update: Instant::now()}
     }
 
     fn debug_print(&self, prefix: &str) {
-        trace!("ringbuffer {}: next {}/{} max {}/{} spare {} overhead {} len {} min {}/{}", prefix, self.next, self.next % self.buf.len() as u64, self.max, self.max % self.buf.len() as u64, self.spare, self.max - self.next + 1, self.buf.len(), self.min, self.min % self.buf.len() as u64);
+        trace!("ringbuffer {}: next {}/{} max {}/{} spare {} overhead {} len {} min {}/{} last_update: {:?}", prefix, self.next, self.next % self.buf.len() as u64, self.max, self.max % self.buf.len() as u64, self.spare, self.max - self.next + 1, self.buf.len(), self.min, self.min % self.buf.len() as u64, self.last_update.elapsed());
     }
 
-    pub fn peek(&self, target_len: u64) -> bool {
+    pub fn peek(&self, target_len: u64) -> PeekState {
         self.debug_print("peek: ");  // DEBUG
         let buf_len = self.buf.len() as u64;
         // TODO: Combine if clauses (added to have debug output only)
         if self.max == 0 {
-            trace!("no data yet added. Return None.");
-            return false;
+            trace!("no data yet added. Return Ignore.");
+            return PeekState::Ignore;
+        }
+        let elapsed = self.last_update.elapsed().subsec_nanos() / 1000000;
+        if (elapsed > 500) {  // TODO
+            trace!("This buffer is idle, elapsed is {}", elapsed);
+            return PeekState::Idle;
         }
         if (self.next == 0) && (self.min > 0) && (self.max - self.min) < self.spare {
-            trace!("not enough data added yet. Return None.");
-            return false;
+            trace!("not enough data added yet. Return Ignore.");
+            return PeekState::Ignore;
         }
         if (self.next == 0) && (self.max - self.min < target_len) {
             trace!("buffer has only {}, but need {}, return None", self.max - self.min, target_len);
-            return false;
+            return PeekState::Ignore;
         }
         if (self.next != 0) && (self.max - self.next < target_len)  {
             trace!("buffer has only {}, but need {}, return None", self.max - self.next, target_len);
-            return false;
+            return PeekState::None;
         }
-        true
+        let avail = if self.next == 0 {self.max - self.min} else {self.max - self.next};
+        trace!("we have data, return Avail({})", avail);
+        PeekState::Avail(avail)
     }
 
     pub fn get_next(&mut self, target_len: u64) -> Option<Vec<i16>> {
@@ -188,7 +204,7 @@ impl RingBuffer {
 //*/
     fn store_data(&mut self, data: AudioData) -> Result<Option<()>, String> {
         let buf_len = self.buf.len() as u64;
-        trace!("store data at pos {} of len {}", data.pos, data.data.len());
+        trace!("store data from client {} at pos {} of len {}", data.client_id, data.pos, data.data.len());
         assert!(data.data.len() < buf_len as usize);
         if (self.next > 0) && (self.next >= data.pos + data.data.len() as u64) {
             trace!("data with pos {} and length {} is beyond next at {}", data.pos, data.data.len(), self.next);
@@ -223,7 +239,8 @@ impl RingBuffer {
             trace!("new max: {}", self.max);
         }
         if (self.next == 0) && (self.min > 0) && (self.max - self.min >= buf_len) {
-            panic!("overwrap!");
+            trace!("max overrun while self.next == 0. (max {} min {} buf_len {}). Setting min = {}", self.max, self.min, buf_len, self.max - buf_len + 1);
+            self.min = self.max - buf_len + 1
         }
         if (self.next == 0) && ( (self.min == 0) || (self.min > data.pos) ) {
             trace!("Setting min to {}", data.pos);
@@ -234,6 +251,8 @@ impl RingBuffer {
             self.next = self.max - buf_len + 1;
             trace!("next overrun to {}", self.next);
         }
+        self.last_update = Instant::now();
+        //trace!("set last_update to {:?}", self.last_update);
         return Ok(Some(()));
     }
 
@@ -281,10 +300,26 @@ impl AudioBuffer {
             return None;
         }
 
+        let mut min_avail = 0;
+        let mut has_none = false;
         for (id, buffer) in &self.rings {
-            if !buffer.peek(len as u64) {
-                return None;
+            match buffer.peek(len as u64) {
+                PeekState::Ignore => continue,
+                PeekState::Avail(val) => {
+                    if (min_avail == 0) || (val < min_avail) {
+                        min_avail = val;
+                    }
+                },
+                PeekState::Idle => continue,
+                PeekState::None => {
+                    has_none = true;
+                }
             }
+        }
+        trace!("result of availability check: has_none {} min_avail {} spare {}", has_none, min_avail, self.spare);
+        if (has_none == true) && (min_avail < self.spare) {   // TODO: What: len or self.spare?
+            trace!("Not all buffers have data, return None.");
+            return None;
         }
         // Adding all buffers:
         for (id, buffer) in &mut self.rings {
@@ -417,6 +452,33 @@ impl Player {
 //*/                trace!("Ready to sleep");
                 
 
+                // Option2: Read as many buckets as available, wait an appropriate time:
+//                trace!("Remain: {}", player.get_remain());
+//                trace!("Reading data from ringbuffer");
+//                match buffer_mutex_play.lock().unwrap().get_next(read_bucket_len) {
+//                    Some(data) => {
+//                        seq = seq + 1;
+//                        trace!("Calling play / seq {}", seq);
+//                        player.play(data);
+//                        //std::thread::sleep(std::time::Duration::from_millis(50 as u64));
+//                        continue;
+//                    },
+//                    None => {
+//                        trace!("Player returns no data, so do not play data");
+//                    }
+//                };
+//                let local_delay = if seq > 0 {
+//                    900.0 * ((seq * rbl) as f32/ sr as f32 )
+//                }
+//                else {
+//                    50.0 * ((1 * rbl) as f32/ sr as f32 )
+//                };
+//                trace!("Sleeping {} after seq {}", local_delay, seq);
+//                std::thread::sleep(std::time::Duration::from_millis(local_delay as u64));
+//                seq = 0;
+//
+
+                // Option 3: Read only one bucket
                 trace!("Remain: {}", player.get_remain());
                 trace!("Reading data from ringbuffer");
                 match buffer_mutex_play.lock().unwrap().get_next(read_bucket_len) {
@@ -424,15 +486,13 @@ impl Player {
                         seq = seq + 1;
                         trace!("Calling play / seq {}", seq);
                         player.play(data);
-                        //std::thread::sleep(std::time::Duration::from_millis(50 as u64));
-                        continue;
                     },
                     None => {
                         trace!("Player returns no data, so do not play data");
                     }
                 };
                 let local_delay = if seq > 0 {
-                    900.0 * ((seq * rbl) as f32/ sr as f32 )
+                    200.0 * ((seq * rbl) as f32/ sr as f32 )
                 }
                 else {
                     50.0 * ((1 * rbl) as f32/ sr as f32 )
@@ -440,7 +500,7 @@ impl Player {
                 trace!("Sleeping {} after seq {}", local_delay, seq);
                 std::thread::sleep(std::time::Duration::from_millis(local_delay as u64));
                 seq = 0;
-            }
+}
         });
     }
     
@@ -487,6 +547,7 @@ impl Recorder {
         loop {
             let mut data = AudioData{ data: vec![0_i16; write_bucket_len as usize], pos: i, client_id: self.client_id };
             io.readi(&mut data.data[..])?;
+            trace!("recorder with client_id {} calls callback for data at pos {} with len {}", self.client_id, i, write_bucket_len);
             callback(data);
             i = i + write_bucket_len;
         }
