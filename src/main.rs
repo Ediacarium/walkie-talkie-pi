@@ -27,6 +27,21 @@ use std::io::Write;
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 use getopts::Options;
 
+fn live(config: &audio::AudioConfig, ring_buf_len: u32, write_bucket_len: u64, read_bucket_len: u32, spare_len: u64, delay: u64) {
+    let buffer_mutex_play = sync::Arc::new(sync::Mutex::new(audio::AudioBuffer::new(ring_buf_len, spare_len)));
+    let buffer_mutex_write = buffer_mutex_play.clone();
+
+    audio::Recorder::spawn_record_thread(&config, 12345, write_bucket_len, buffer_mutex_write);
+
+    //std::thread::sleep(std::time::Duration::from_millis(delay));
+    
+    audio::Player::spawn_play_thread(&config, read_bucket_len, buffer_mutex_play);
+    
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10000));
+    }
+}
+
 fn main() {
     env_logger::init().unwrap();
     let mut rng = rand::thread_rng();
@@ -78,6 +93,8 @@ fn main() {
     //let config = audio::AudioConfig { devname: "plughw:Set", num_channels: 1, sample_rate: 44100 };
     let config = audio::AudioConfig { devname: &devname, num_channels: 1, sample_rate: 44100 };
 
+    //live(&config, ring_buf_len, write_bucket_len, read_bucket_len, spare_len, delay);
+        
     let port = 1337;
     let addr = rng.gen();
 
@@ -95,6 +112,7 @@ fn main() {
     thread::spawn(move || {
     	loop {
     	    let (data, _, _) = rx.receive().unwrap();
+            println!("about to write to buffer");
 	    buffer_mutex_write.lock().unwrap().store_data(data);
     	}
     });
