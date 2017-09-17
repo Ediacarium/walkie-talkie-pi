@@ -24,6 +24,7 @@ pub struct RingBuffer {
     min: u64,   // points to the first filled element as long as next == 0
     max: u64,   // points to the last filled element, i.e. buf[max] is set
     spare: u64, // number of samples to always keep in buffer
+    idle_threshold: u32,  // time in ms until a buffer is marked as idle
     last_update: Instant,
 }
 
@@ -35,9 +36,9 @@ enum PeekState {
 }
 
 impl RingBuffer {
-    pub fn new(buf_len: u32, spare: u64) -> RingBuffer {
+    pub fn new(buf_len: u32, spare: u64, idle_threshold: u32) -> RingBuffer {
         assert!(spare < buf_len as u64);
-        RingBuffer { buf: vec![0_i16;buf_len as usize], max: 0, next: 0, spare: spare, min: 0, last_update: Instant::now()}
+        RingBuffer { buf: vec![0_i16;buf_len as usize], max: 0, next: 0, spare: spare, min: 0, idle_threshold: idle_threshold, last_update: Instant::now()}
     }
 
     fn debug_print(&self, prefix: &str) {
@@ -52,8 +53,9 @@ impl RingBuffer {
             trace!("no data yet added. Return Ignore.");
             return PeekState::Ignore;
         }
-        let elapsed = self.last_update.elapsed().subsec_nanos() / 1000000;
-        if (elapsed > 500) {  // TODO
+        let elapsed = self.last_update.elapsed().as_secs()*1000 + (self.last_update.elapsed().subsec_nanos()/1000000) as u64;
+        trace!("elapsed= {}", elapsed);
+        if elapsed > self.idle_threshold as u64 {
             trace!("This buffer is idle, elapsed is {}", elapsed);
             return PeekState::Idle;
         }
@@ -263,13 +265,14 @@ impl RingBuffer {
 pub struct AudioBuffer {
     buf_len: u32,
     spare: u64,
+    idle_threshold: u32,
     rings: HashMap<u16, RingBuffer>,
 }
 
 impl AudioBuffer {
     // buf_len is needed in order to create silence and temp buffer
-    pub fn new(buf_len: u32, spare: u64) -> AudioBuffer {
-        AudioBuffer {buf_len: buf_len, spare: spare, rings: HashMap::new()}
+    pub fn new(buf_len: u32, spare: u64, idle_threshold: u32) -> AudioBuffer {
+        AudioBuffer {buf_len: buf_len, spare: spare, idle_threshold: idle_threshold, rings: HashMap::new()}
     }
 
     pub fn store_data(&mut self, data: AudioData) -> Result<Option<()>, String> {
@@ -277,7 +280,7 @@ impl AudioBuffer {
         // Note: Since we automatically add new clients, each client will use a ringbuffer with the same configuration
         if ! self.rings.contains_key(&data.client_id) {
             trace!("store_data() called for non-existing client id {}", data.client_id);
-            self.rings.insert(data.client_id, RingBuffer::new(self.buf_len, self.spare));
+            self.rings.insert(data.client_id, RingBuffer::new(self.buf_len, self.spare, self.idle_threshold));
         }
         match self.rings.get_mut(&data.client_id) {
             Some(buffer) => buffer.store_data(data),

@@ -27,8 +27,8 @@ use std::io::Write;
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 use getopts::Options;
 
-fn live(config: &audio::AudioConfig, ring_buf_len: u32, write_bucket_len: u64, read_bucket_len: u32, spare_len: u64, delay: u64) {
-    let buffer_mutex_play = sync::Arc::new(sync::Mutex::new(audio::AudioBuffer::new(ring_buf_len, spare_len)));
+fn live(config: &audio::AudioConfig, ring_buf_len: u32, write_bucket_len: u64, read_bucket_len: u32, spare_len: u64, delay: u64, idle_threshold: u32) {
+    let buffer_mutex_play = sync::Arc::new(sync::Mutex::new(audio::AudioBuffer::new(ring_buf_len, spare_len, idle_threshold)));
     let buffer_mutex_write = buffer_mutex_play.clone();
 
     audio::Recorder::spawn_record_thread(&config, 12345, write_bucket_len, buffer_mutex_write);
@@ -56,6 +56,7 @@ fn main() {
     opts.optopt("s", "spare-size", "set size in bytes of spare area in ring buffer", "SIZE");
     opts.optopt("d", "delay", "set delay in ms", "DELAYMS");
     opts.optopt("a", "audio-device", "set name of audio-device", "NAME");
+    opts.optopt("i", "idle-threshold", "threshold in ms to mark buffer as idle", "TIME");
     opts.optflag("h", "help", "print this help menu");
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -81,6 +82,10 @@ fn main() {
         Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
         None => 20000
     };
+    let idle_threshold = match matches.opt_str("i") {
+        Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
+        None => 500
+    };
     let delay = match matches.opt_str("d") {
         Some(val) => val.parse().unwrap_or_else(|err| panic!("could not parse '{}': {}", args[1], err)),
         None => 1000
@@ -93,14 +98,14 @@ fn main() {
     //let config = audio::AudioConfig { devname: "plughw:Set", num_channels: 1, sample_rate: 44100 };
     let config = audio::AudioConfig { devname: &devname, num_channels: 1, sample_rate: 44100 };
 
-    //live(&config, ring_buf_len, write_bucket_len, read_bucket_len, spare_len, delay);
+    //live(&config, ring_buf_len, write_bucket_len, read_bucket_len, spare_len, delay, idle_threshold);
         
     let port = 1337;
     let addr = rng.gen();
 
     let (mut tx,rx) = packet_layer(port,addr).unwrap();
 
-    let buffer_mutex_play = sync::Arc::new(sync::Mutex::new(audio::AudioBuffer::new(ring_buf_len, spare_len)));
+    let buffer_mutex_play = sync::Arc::new(sync::Mutex::new(audio::AudioBuffer::new(ring_buf_len, spare_len, idle_threshold)));
     let buffer_mutex_write = buffer_mutex_play.clone();
 
     //audio::Recorder::spawn_record_thread(&config, 12345, buffer_mutex_write);
