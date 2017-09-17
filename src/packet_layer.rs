@@ -1,6 +1,5 @@
 //use self::bincode::SizeLimit;
 
-use std::vec::Vec;
 use std::clone::Clone;
 use std::collections::{HashMap, VecDeque};
 use std::marker::Send;
@@ -10,11 +9,9 @@ use std::thread::{JoinHandle};
 use bincode::{serialize, deserialize, Infinite};
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
-use std::sync::mpsc::TryRecvError;
-use std::sync::mpsc::RecvError;
+use std::sync::mpsc::{TryRecvError, RecvError};
 use std::sync::Arc;
-use std::net::{UdpSocket, Ipv4Addr, SocketAddr};
-use std::str::FromStr;
+use std::net::{UdpSocket, SocketAddr};
 use std::io::Error as IOError;
 
 static IP_ADDR_ANY : &'static str = "0.0.0.0";
@@ -122,24 +119,26 @@ pub struct PacketReceiver<P> {
 
 impl<P> PacketReceiver<P> {
     pub fn receive(&self) -> Result<(P, i64, u8), RecvError> {
-        let packet = try!(self.receiver.recv());
+        let packet = self.receiver.recv()?;
         Ok((packet.payload, packet.packet.source_ip_addr, packet.packet.sequence_number))
     }
 
     pub fn try_receive(&self) -> Result<(P, i64, u8), TryRecvError> {
-        let packet = try!(self.receiver.try_recv());
+        let packet = self.receiver.try_recv()?;
         Ok((packet.payload, packet.packet.source_ip_addr, packet.packet.sequence_number))
     }
 }
 
 pub fn packet_layer<P: 'static>(port: u16, ip_address:i64) -> Result<(PacketSender<P>, PacketReceiver<P>), IOError> 
 	where for<'de> P: Send + Clone + Serialize + Deserialize<'de>{
+
     let (send_tx, send_rx) = channel();
     let (receive_tx, receive_rx) = channel();
-    let socket = try!(UdpSocket::bind((IP_ADDR_ANY, port)));
+
+    let socket = (UdpSocket::bind((IP_ADDR_ANY, port)))?;
     let worker_socket = socket.try_clone().unwrap();
-    worker_socket.set_broadcast(true);
-    worker_socket.join_multicast_v4(&Ipv4Addr::from_str(BROADCAST_ALL).unwrap(), &Ipv4Addr::from_str(IP_ADDR_ANY).unwrap());
+    worker_socket.set_broadcast(true)?;
+
     let workthread = thread::spawn(move|| {worker_loop(port, ip_address, worker_socket, send_rx, receive_tx)});
     let worker = Arc::new(workthread);
     Ok((PacketSender {
@@ -162,7 +161,7 @@ fn handle_advertisement<P>(advertisementpacket: AdvertisementPacket, socket: &Ud
     if let None =  id_to_packet.get(&advertisementpacket.packet) {
         debug!("Haven't received Payload Packet yet, sending send request");
         let sendrequest : SendablePackets<P> = SendablePackets::SendRequestPacket(SendRequestPacket::new(&advertisementpacket));
-        socket.send_to(&serialize(&sendrequest, Infinite).unwrap(), source);
+        socket.send_to(&serialize(&sendrequest, Infinite).unwrap(), source).unwrap_or_else(|err| {error!("Failed to send advertisement, got {}", err); 0});
     } else {
         debug!("Already got advertised Packet, ignoring advertisement.");
     }
@@ -172,7 +171,7 @@ fn handle_send_request<P>(sendrequestpacket: SendRequestPacket, socket: &UdpSock
 	where P: Clone + Serialize{
     info!("handling send request packet");
     if let Some(packet) = id_to_packet.get(&sendrequestpacket.packet) {
-        socket.send_to(&serialize(&SendablePackets::PayloadPacket(packet.clone()), Infinite).unwrap(), source);
+        socket.send_to(&serialize(&SendablePackets::PayloadPacket(packet.clone()), Infinite).unwrap(), source).unwrap_or_else(|err| {error!("Failed to send send request, got {}", err); 0});
     } else {
         debug!("failed to find requested packet, ignoring");
     }
@@ -193,7 +192,7 @@ fn handle_payload<P>(payloadpacket: PayloadPacket<P>, socket: &UdpSocket, id_to_
         let advertisement : SendablePackets<P> = SendablePackets::AdvertisementPacket(AdvertisementPacket::new(&payloadpacket, ip_address));
         let advertisement_encoded = &serialize(&advertisement, Infinite).unwrap();
         info!("sending {} Bytes : {:?}", advertisement_encoded.len(), advertisement_encoded);
-        socket.send_to(advertisement_encoded, (BROADCAST_ALL, port));
+        socket.send_to(advertisement_encoded, (BROADCAST_ALL, port)).unwrap_or_else(|err| {error!("Failed to send payload, got {}", err); 0});
 
         if let Err(_) = received.send(payloadpacket.clone()) {
             warn!("Cannot forward received PayloadPacket");
